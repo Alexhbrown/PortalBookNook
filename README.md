@@ -7,6 +7,10 @@ Arduino sketches for the Portal Book Nook project, including ESP32-CAM stream se
   - TCP JPEG stream for CYD on port `5000`
   - Web tuning UI on port `80`
   - Persistent camera settings (NVS / Preferences)
+- `PortalBlueDisplay/PortalBlueDisplay.ino`: CYD display client with:
+  - Live JPEG decode and draw controls
+  - Local display tuning UI
+  - ASCII boot screen and connection diagnostics
 
 ## Notes
 - Camera pin mapping is for AI-Thinker ESP32-CAM.
