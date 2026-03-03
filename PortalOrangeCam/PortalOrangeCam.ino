@@ -5,6 +5,7 @@
 // - Persistent camera settings via Preferences (NVS)
 
 #include "esp_camera.h"
+#include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_http_server.h>
@@ -17,6 +18,11 @@
 const char* AP_SSID = "BluePortal";
 const char* AP_PASS = "TheCakeIsALie";
 const uint16_t TCP_PORT = 5000;
+
+const char* OTA_WIFI_SSID = "ahb-IOT";
+const char* OTA_WIFI_PASS = "0987654321";
+const char* OTA_HOSTNAME = "portal-orangecam";
+const uint32_t OTA_MODE_TIMEOUT_MS = 10UL * 60UL * 1000UL;
 
 // ---------- Camera pin definition (AI-Thinker) ----------
 #define PWDN_GPIO_NUM     32
@@ -88,6 +94,15 @@ static volatile uint32_t lastPreviewRequestMs = 0;
 static bool lastTcpConnected = false;
 static uint32_t captureHitCount = 0;
 
+static bool otaMode = false;
+static bool otaNetworkReady = false;
+static bool otaHttpServerStarted = false;
+static uint32_t otaModeStartMs = 0;
+static uint32_t otaReconnectAttemptMs = 0;
+
+static bool restartScheduled = false;
+static uint32_t restartAtMs = 0;
+
 int clampInt(int value, int minValue, int maxValue) {
   if (value < minValue) return minValue;
   if (value > maxValue) return maxValue;
@@ -103,6 +118,16 @@ void logCaptureOccasional() {
   if ((captureHitCount % 20) == 1) {
     Serial.printf("[HTTP] /capture.jpg (count=%lu)\n", (unsigned long)captureHitCount);
   }
+}
+
+void scheduleRestart(uint32_t delayMs = 350) {
+  restartScheduled = true;
+  restartAtMs = millis() + delayMs;
+}
+
+bool restartDue() {
+  if (!restartScheduled) return false;
+  return (int32_t)(millis() - restartAtMs) >= 0;
 }
 
 CameraSettings defaultSettings() {
@@ -494,8 +519,111 @@ bool sendTcpFrameFromCache(WiFiClient& c) {
   return true;
 }
 
+void setOtaModeFlag(bool enabled) {
+  prefs.putBool("otamode", enabled);
+}
+
+bool connectOtaStaBlocking(uint32_t timeoutMs) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  WiFi.disconnect(true, true);
+  delay(80);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(OTA_WIFI_SSID, OTA_WIFI_PASS);
+
+  Serial.printf("[OTA] Connecting to %s", OTA_WIFI_SSID);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    Serial.print(".");
+    delay(250);
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[OTA] Wi-Fi connect timed out.");
+    return false;
+  }
+
+  Serial.printf("[OTA] Wi-Fi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  return true;
+}
+
+void beginArduinoOtaIfReady() {
+  if (otaNetworkReady || WiFi.status() != WL_CONNECTED) return;
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.onStart([]() { Serial.println("[OTA] Update start"); });
+  ArduinoOTA.onEnd([]() { Serial.println("\n[OTA] Update end"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    static uint32_t lastPrint = 0;
+    uint32_t now = millis();
+    if (now - lastPrint < 500) return;
+    lastPrint = now;
+    unsigned int pct = (total == 0) ? 0 : (progress * 100U) / total;
+    Serial.printf("[OTA] Progress: %u%%\n", pct);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[OTA] Error[%u]\n", (unsigned)error);
+  });
+  ArduinoOTA.begin();
+  otaNetworkReady = true;
+  Serial.printf("[OTA] Ready. Hostname: %s, IP: %s, Port: 3232\n",
+                OTA_HOSTNAME, WiFi.localIP().toString().c_str());
+}
+
+static const char OTA_INDEX_HTML[] = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Portal OrangeCam OTA Mode</title>
+  <style>
+    body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin: 14px; background:#111; color:#f2f2f2; }
+    h2 { margin: 0 0 8px 0; }
+    .row { margin: 8px 0; padding: 10px; background:#1b1b1b; border-radius:10px; }
+    .line button { padding:8px 12px; border:0; border-radius:8px; background:#2b6fff; color:#fff; }
+    .small { color:#aaa; font-size:13px; margin:6px 0; }
+  </style>
+</head>
+<body>
+  <h2>Portal OrangeCam OTA Mode</h2>
+  <div class="small">Device is on ahb-IOT for Arduino OTA uploads.</div>
+  <div id="statusLine" class="small">Loading...</div>
+  <div class="row line">
+    <button onclick="refreshStatus()">Refresh</button>
+    <button onclick="exitOta()">Exit OTA Mode</button>
+  </div>
+  <script>
+    async function refreshStatus() {
+      try {
+        const r = await fetch('/status');
+        const s = await r.json();
+        document.getElementById('statusLine').textContent = `IP ${s.ip} | host ${s.hostname} | timeout ${s.ota_timeout_sec}s`;
+      } catch (_) {
+        document.getElementById('statusLine').textContent = 'Status fetch failed';
+      }
+    }
+    async function exitOta() {
+      const r = await fetch('/ota/exit');
+      alert(await r.text());
+    }
+    refreshStatus();
+    setInterval(refreshStatus, 2000);
+  </script>
+</body>
+</html>
+)HTML";
+
 esp_err_t sendStatusJson(httpd_req_t* req) {
-  char json[640];
+  char json[760];
+  uint32_t remainingSec = 0;
+  if (otaMode) {
+    uint32_t elapsed = millis() - otaModeStartMs;
+    if (elapsed < OTA_MODE_TIMEOUT_MS) {
+      remainingSec = (OTA_MODE_TIMEOUT_MS - elapsed) / 1000U;
+    }
+  }
   int n = snprintf(
       json, sizeof(json),
       "{\"quality\":%d,\"brightness\":%d,\"contrast\":%d,\"saturation\":%d,"
@@ -504,14 +632,17 @@ esp_err_t sendStatusJson(httpd_req_t* req) {
       "\"gainceiling\":%d,\"awb\":%d,\"awb_gain\":%d,\"wb_mode\":%d,"
       "\"lenc\":%d,\"hmirror\":%d,\"vflip\":%d,\"bpc\":%d,\"wpc\":%d,"
       "\"raw_gma\":%d,\"special_effect\":%d,\"colorbar\":%d,"
-      "\"stream_interval_ms\":%u,\"preview_interval_ms\":%u}",
+      "\"stream_interval_ms\":%u,\"preview_interval_ms\":%u,"
+      "\"ota_mode\":%d,\"ota_timeout_sec\":%lu,\"ip\":\"%s\",\"hostname\":\"%s\"}",
       settings.quality, settings.brightness, settings.contrast, settings.saturation,
       settings.sharpness, settings.denoise, settings.aec2, settings.ae_level,
       settings.aec_value, settings.aec, settings.agc, settings.agc_gain,
       settings.gainceiling, settings.awb, settings.awb_gain, settings.wb_mode,
       settings.lenc, settings.hmirror, settings.vflip, settings.bpc, settings.wpc,
       settings.raw_gma, settings.special_effect, settings.colorbar,
-      (unsigned)streamFrameIntervalMs, (unsigned)previewFrameIntervalMs);
+      (unsigned)streamFrameIntervalMs, (unsigned)previewFrameIntervalMs,
+      otaMode ? 1 : 0, (unsigned long)remainingSec,
+      WiFi.localIP().toString().c_str(), OTA_HOSTNAME);
 
   if (n <= 0) return ESP_FAIL;
 
@@ -545,6 +676,9 @@ static const char INDEX_HTML[] = R"HTML(
     <label><input id="autoRefresh" type="checkbox"> Live preview</label>
     <button onclick="refreshOnce()">Refresh Now</button>
     <button onclick="resetDefaults()">Reset Defaults</button>
+  </div>
+  <div class="row line">
+    <button onclick="enterOtaMode()">Enter OTA Mode (ahb-IOT)</button>
   </div>
 
   <div class="row"><span class="name">JPEG Quality (lower = better)</span><div class="line"><input id="quality" type="range" min="4" max="63"><span id="quality_v"></span></div></div>
@@ -603,6 +737,16 @@ static const char INDEX_HTML[] = R"HTML(
       await fetch("/reset");
       await loadStatus();
       refreshOnce();
+    }
+
+    async function enterOtaMode() {
+      if (!confirm("Reboot camera into OTA mode on ahb-IOT?")) return;
+      try {
+        const r = await fetch("/ota/start");
+        alert(await r.text());
+      } catch (_) {
+        alert("Failed to request OTA mode");
+      }
     }
 
     async function loadStatus() {
@@ -763,6 +907,30 @@ esp_err_t handleReset(httpd_req_t* req) {
   return sendStatusJson(req);
 }
 
+esp_err_t handleOtaStart(httpd_req_t* req) {
+  logHttp("/ota/start");
+  setOtaModeFlag(true);
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_send(req, "Rebooting into OTA mode on ahb-IOT...", HTTPD_RESP_USE_STRLEN);
+  scheduleRestart();
+  return ESP_OK;
+}
+
+esp_err_t handleOtaExit(httpd_req_t* req) {
+  logHttp("/ota/exit");
+  setOtaModeFlag(false);
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_send(req, "Exiting OTA mode and rebooting...", HTTPD_RESP_USE_STRLEN);
+  scheduleRestart();
+  return ESP_OK;
+}
+
+esp_err_t handleOtaIndex(httpd_req_t* req) {
+  logHttp("/");
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, OTA_INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
 esp_err_t handleNoContent(httpd_req_t* req) {
   return httpd_resp_send(req, "", 0);
 }
@@ -795,6 +963,8 @@ bool startHttpServer() {
   registerHttpUri("/capture.jpg", handleCapture);
   registerHttpUri("/control", handleControl);
   registerHttpUri("/reset", handleReset);
+  registerHttpUri("/ota/start", handleOtaStart);
+  registerHttpUri("/ota/exit", handleOtaExit);
 
   // iPhone / captive portal probes to avoid noisy 404 spam.
   registerHttpUri("/favicon.ico", handleNoContent);
@@ -807,6 +977,52 @@ bool startHttpServer() {
 
   Serial.println("HTTP tuning UI started on port 80");
   return true;
+}
+
+bool startOtaHttpServer() {
+  if (httpServer != nullptr) return true;
+
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.max_uri_handlers = 12;
+  config.stack_size = 8192;
+  config.recv_wait_timeout = 10;
+  config.send_wait_timeout = 10;
+
+  if (httpd_start(&httpServer, &config) != ESP_OK) {
+    Serial.println("[OTA] Failed to start OTA HTTP server");
+    return false;
+  }
+
+  registerHttpUri("/", handleOtaIndex);
+  registerHttpUri("/ping", handlePing);
+  registerHttpUri("/status", sendStatusJson);
+  registerHttpUri("/ota/exit", handleOtaExit);
+
+  registerHttpUri("/favicon.ico", handleNoContent);
+  registerHttpUri("/apple-touch-icon.png", handleNoContent);
+  registerHttpUri("/apple-touch-icon-precomposed.png", handleNoContent);
+  registerHttpUri("/hotspot-detect.html", handleNoContent);
+  registerHttpUri("/generate_204", handleNoContent);
+  registerHttpUri("/connecttest.txt", handleNoContent);
+  registerHttpUri("/ncsi.txt", handleNoContent);
+
+  otaHttpServerStarted = true;
+  Serial.println("[OTA] HTTP status page started on port 80");
+  return true;
+}
+
+void setupOtaMode() {
+  otaMode = true;
+  otaModeStartMs = millis();
+  otaReconnectAttemptMs = 0;
+  otaNetworkReady = false;
+
+  Serial.println("[OTA] OTA mode requested. Skipping AP stream mode.");
+  if (connectOtaStaBlocking(20000)) {
+    beginArduinoOtaIfReady();
+    startOtaHttpServer();
+  }
 }
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -842,6 +1058,12 @@ void setup() {
   }
 
   loadSettingsFromNvs();
+  otaMode = prefs.getBool("otamode", false);
+
+  if (otaMode) {
+    setupOtaMode();
+    return;
+  }
 
   Serial.println("Initializing camera...");
   if (!initCamera()) {
@@ -875,6 +1097,40 @@ void setup() {
 }
 
 void loop() {
+  if (restartDue()) {
+    ESP.restart();
+  }
+
+  if (otaMode) {
+    uint32_t now = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!otaNetworkReady) {
+        beginArduinoOtaIfReady();
+      }
+      if (!otaHttpServerStarted) {
+        startOtaHttpServer();
+      }
+      if (otaNetworkReady) {
+        ArduinoOTA.handle();
+      }
+    } else if ((now - otaReconnectAttemptMs) > 5000) {
+      otaReconnectAttemptMs = now;
+      otaNetworkReady = false;
+      Serial.printf("[OTA] Reconnecting to %s...\n", OTA_WIFI_SSID);
+      WiFi.disconnect(false, false);
+      WiFi.begin(OTA_WIFI_SSID, OTA_WIFI_PASS);
+    }
+
+    if ((now - otaModeStartMs) >= OTA_MODE_TIMEOUT_MS) {
+      Serial.println("[OTA] Timeout reached, returning to BluePortal mode.");
+      setOtaModeFlag(false);
+      scheduleRestart();
+    }
+
+    delay(2);
+    return;
+  }
+
   bool tcpReady = (tcpClient && tcpClient.connected());
 
   if (lastTcpConnected && !tcpReady) {
